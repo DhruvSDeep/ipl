@@ -25,12 +25,11 @@ Stage 2 -- LGBM regressor
 
 from __future__ import annotations
 
-import time
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import lightgbm as lgb
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -46,11 +45,6 @@ PLAYER_STATS_PATH = ARCHIVE / "player_stats.csv"
 LOSS_PLOT_PATH = ARCHIVE / "stage1_loss.png"
 
 
-def _banner(text: str, char: str = "=") -> None:
-    line = char * (len(text) + 6)
-    print(f"\n{line}\n== {text} ==\n{line}")
-
-
 def _sparkline(values: list[float]) -> str:
     bars = "▁▂▃▄▅▆▇█"
     lo, hi = min(values), max(values)
@@ -58,14 +52,6 @@ def _sparkline(values: list[float]) -> str:
         return bars[0] * len(values)
     return "".join(bars[int((v - lo) / (hi - lo) * (len(bars) - 1))] for v in values)
 
-
-def _print_metrics_table(rows: list[tuple[str, dict[str, float]]]) -> None:
-    name_w = max(len(n) for n, _ in rows)
-    header = f"  {'split'.ljust(name_w)}   {'MAE':>7}   {'RMSE':>7}"
-    print(header)
-    print(f"  {'-' * name_w}   {'-' * 7}   {'-' * 7}")
-    for name, m in rows:
-        print(f"  {name.ljust(name_w)}   {m['MAE']:7.2f}   {m['RMSE']:7.2f}")
 
 PLAYER_STAT_COLS = ["runs", "strike_rate", "wickets", "balls_bowled", "economy"]
 
@@ -91,6 +77,7 @@ EMBED_DIM = 16
 EMBED_EPOCHS = 80
 EMBED_LR = 5e-3
 EMBED_BATCH = 64
+EMBED_PATIENCE = 10
 
 LGBM_PARAMS: dict = {
     "objective": "regression_l1",
@@ -288,22 +275,45 @@ def _onehot_remaining_cats(df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
     return dummies.to_numpy(dtype=np.float32), dummies.columns.tolist()
 
 
+def _eval_mae(model: nn.Module, loader: DataLoader, loss_fn: nn.Module) -> float:
+    model.eval()
+    total, n = 0.0, 0
+    with torch.no_grad():
+        for batch in loader:
+            *inputs, y = batch
+            pred = model(*inputs)
+            total += loss_fn(pred, y).item() * y.size(0)
+            n += y.size(0)
+    return total / n
+
+
 def train_player_encoder(
     df: pd.DataFrame,
     player_vocab: PlayerVocab,
     venue_vocab: ScalarVocab,
     stats_matrix: np.ndarray,
     train_mask: pd.Series,
+    val_mask: pd.Series,
     epochs: int = EMBED_EPOCHS,
     batch_size: int = EMBED_BATCH,
     lr: float = EMBED_LR,
     embed_dim: int = EMBED_DIM,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Train Stage 1. Returns (player_embeddings, venue_embeddings)."""
+    patience: int = EMBED_PATIENCE,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Train Stage 1 with val-based early stopping.
+
+    Stops after `patience` consecutive epochs with no improvement in
+    validation MAE and restores the best-val weights before returning.
+    Returns (player_emb, venue_emb, history) where history has keys
+    "train", "val", "best_epoch".
+    """
     cat_mat, _ = _onehot_remaining_cats(df)
     train_rows = df[train_mask].reset_index(drop=True)
-    ds = EmbedDataset(train_rows, player_vocab, venue_vocab, cat_mat[train_mask.to_numpy()])
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=_collate)
+    val_rows = df[val_mask].reset_index(drop=True)
+    train_ds = EmbedDataset(train_rows, player_vocab, venue_vocab, cat_mat[train_mask.to_numpy()])
+    val_ds = EmbedDataset(val_rows, player_vocab, venue_vocab, cat_mat[val_mask.to_numpy()])
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=_collate)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=_collate)
 
     model = PlayerEncoder(
         player_vocab_size=len(player_vocab),
@@ -319,12 +329,19 @@ def train_player_encoder(
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = nn.L1Loss()
 
-    history: list[float] = []
+    train_hist: list[float] = []
+    val_hist: list[float] = []
+    best_val = float("inf")
+    best_epoch = 0
+    best_state: dict | None = None
+    bad_epochs = 0
+    stopped_early = False
+
     pbar = tqdm(range(epochs), desc="  training", unit="ep", leave=True)
-    for _ in pbar:
+    for epoch in pbar:
         model.train()
         total, n = 0.0, 0
-        for batch in loader:
+        for batch in train_loader:
             *inputs, y = batch
             pred = model(*inputs)
             loss = loss_fn(pred, y)
@@ -333,31 +350,43 @@ def train_player_encoder(
             opt.step()
             total += loss.item() * y.size(0)
             n += y.size(0)
-        epoch_mae = total / n
-        history.append(epoch_mae)
-        pbar.set_postfix(MAE=f"{epoch_mae:.2f}")
+        train_mae = total / n
+        val_mae = _eval_mae(model, val_loader, loss_fn)
+        train_hist.append(train_mae)
+        val_hist.append(val_mae)
+        pbar.set_postfix(train=f"{train_mae:.2f}", val=f"{val_mae:.2f}")
 
-    if len(history) >= 2:
-        print(f"  loss  {_sparkline(history)}  "
-              f"[{history[0]:.1f} → {history[-1]:.1f} runs]")
-        try:
-            fig, ax = plt.subplots(figsize=(8, 3.5))
-            ax.plot(history, linewidth=1.5, color="#2a6ebb")
-            ax.set_xlabel("epoch")
-            ax.set_ylabel("train MAE (runs)")
-            ax.set_title("Stage 1 · PlayerEncoder training loss")
-            ax.grid(True, alpha=0.3)
-            fig.tight_layout()
-            fig.savefig(LOSS_PLOT_PATH, dpi=110)
-            plt.close(fig)
-            print(f"  saved loss curve → {LOSS_PLOT_PATH}")
-        except Exception as exc:  # plotting is cosmetic — never fail training
-            print(f"  (plot skipped: {exc})")
+        if val_mae < best_val:
+            best_val = val_mae
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                stopped_early = True
+                pbar.close()
+                print(f"  early stop at epoch {epoch + 1} "
+                      f"(no val improvement for {patience} epochs; "
+                      f"best val MAE {best_val:.2f} @ epoch {best_epoch + 1})")
+                break
+
+    if not stopped_early:
+        print(f"  ran full {epochs} epochs  "
+              f"(best val MAE {best_val:.2f} @ epoch {best_epoch + 1})")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    if len(val_hist) >= 2:
+        print(f"  train {_sparkline(train_hist)}  [{train_hist[0]:.1f} → {train_hist[-1]:.1f}]")
+        print(f"  val   {_sparkline(val_hist)}  [{val_hist[0]:.1f} → {val_hist[-1]:.1f}]")
 
     with torch.no_grad():
         player_emb = model.player_embed.weight.detach().cpu().numpy()
         venue_emb = model.venue_embed.weight.detach().cpu().numpy()
-    return player_emb, venue_emb
+    history = {"train": train_hist, "val": val_hist, "best_epoch": best_epoch}
+    return player_emb, venue_emb, history
 
 
 def pool_by_id(
@@ -480,6 +509,26 @@ def evaluate(model: lgb.Booster, X: pd.DataFrame, y: pd.Series) -> dict[str, flo
     }
 
 
+def evaluate_by_season(
+    model: lgb.Booster,
+    X: pd.DataFrame,
+    y: pd.Series,
+    seasons: pd.Series,
+) -> dict[str, dict[str, float]]:
+    pred = model.predict(X, num_iteration=model.best_iteration)
+    y_arr = y.to_numpy()
+    s_arr = seasons.to_numpy()
+    results: dict[str, dict[str, float]] = {}
+    for season in sorted(np.unique(s_arr)):
+        mask = s_arr == season
+        results[str(season)] = {
+            "MAE": float(mean_absolute_error(y_arr[mask], pred[mask])),
+            "RMSE": float(np.sqrt(mean_squared_error(y_arr[mask], pred[mask]))),
+            "n": int(mask.sum()),
+        }
+    return results
+
+
 def season_mean_baseline(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict[str, float]:
     season_mean = train_df.groupby("season", observed=True)[TARGET].mean()
     overall_mean = train_df[TARGET].mean()
@@ -490,61 +539,3 @@ def season_mean_baseline(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict[
     }
 
 
-# ------------------------------------------------------------------------ main
-
-
-def main():
-    _banner("IPL 1st-innings score prediction · pipeline start")
-    t_total = time.perf_counter()
-
-    _banner("Phase 0 · Data & vocabularies", char="-")
-    df = load_data()
-    is_train_full = time_split_mask(df)
-    is_train, is_val = train_val_split_mask(df, is_train_full)
-    is_test = ~is_train_full
-
-    player_vocab = PlayerVocab.from_df(df)
-    venue_vocab = ScalarVocab.from_series(df[is_train]["venue"])
-    raw_stats, std_stats = load_player_stats(player_vocab)
-    missing = (raw_stats[1:].sum(axis=1) == 0).sum()
-    print(f"  rows         : {len(df):,}")
-    print(f"  player vocab : {len(player_vocab) - 1:,} ({missing} without career stats)")
-    print(f"  venue vocab  : {len(venue_vocab) - 1}")
-    print(f"  test seasons : {', '.join(TEST_SEASONS)}")
-    print(f"  splits       : train={is_train.sum()}  "
-          f"val={is_val.sum()}  test={is_test.sum()}  "
-          f"(val ≈ {VAL_FRAC:.0%} per-season from train)")
-
-    _banner("Phase 1 · PlayerEncoder (PyTorch)", char="-")
-    t1 = time.perf_counter()
-    player_emb, venue_emb = train_player_encoder(
-        df, player_vocab, venue_vocab, std_stats, train_mask=is_train
-    )
-    print(f"  phase 1 elapsed: {time.perf_counter() - t1:.1f}s")
-
-    _banner("Phase 2 · LightGBM on pooled features", char="-")
-    t2 = time.perf_counter()
-    ds = build_features(df, player_vocab, player_emb, venue_vocab, venue_emb, raw_stats)
-    print(f"  feature matrix: {ds.X.shape[0]:,} rows × {ds.X.shape[1]} cols")
-    X_tr, y_tr = ds.X[is_train.to_numpy()], ds.y[is_train.to_numpy()]
-    X_val, y_val = ds.X[is_val.to_numpy()], ds.y[is_val.to_numpy()]
-    X_te, y_te = ds.X[is_test.to_numpy()], ds.y[is_test.to_numpy()]
-
-    model = train_model(X_tr, y_tr, X_val, y_val, categorical_cols=ds.categorical_cols)
-    print(f"  phase 2 elapsed: {time.perf_counter() - t2:.1f}s  "
-          f"(best_iter={model.best_iteration})")
-
-    _banner("Results", char="-")
-    baseline = season_mean_baseline(df[is_train_full], df[is_test])
-    _print_metrics_table([
-        ("baseline (test)", baseline),
-        ("LGBM  (val)   ", evaluate(model, X_val, y_val)),
-        ("LGBM  (test)  ", evaluate(model, X_te, y_te)),
-    ])
-
-    print(f"\ntotal pipeline: {time.perf_counter() - t_total:.1f}s")
-    return model, player_emb, venue_emb
-
-
-if __name__ == "__main__":
-    main()
