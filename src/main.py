@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from modelLogic import (
+    ARCHIVE,
     TARGET,
     TEST_SEASONS,
     VAL_FRAC,
@@ -169,6 +170,13 @@ def main():
         train_mask=is_train, val_mask=is_val,
     )
     print(f"  phase 1 elapsed: {time.perf_counter() - t1:.1f}s")
+
+    emb_path = ARCHIVE / "player_embeddings.npz"
+    names_arr = np.empty(len(player_vocab), dtype=object)
+    for name, idx in player_vocab.id_of.items():
+        names_arr[idx] = name
+    np.savez(emb_path, embeddings=player_emb, names=names_arr)
+    print(f"  saved embeddings → {emb_path}")
 
     _banner("Phase 2 · LightGBM on pooled features", char="-")
     t2 = time.perf_counter()
