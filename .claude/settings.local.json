@@ -1,7 +1,24 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(awk *)",
+      "Bash(python src/_regen_aggregated.py)",
+      "Bash(python src/main.py)",
+      "Bash(where python *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(python -c \"import torch; print\\('torch', torch.__version__\\)\")",
+      "Bash(python -c \"import pandas; print\\('pandas', pandas.__version__\\)\")",
+      "Bash(python -c \"import lightgbm\")",
+      "Bash(python -c \"import tqdm; print\\('tqdm', tqdm.__version__\\)\")",
+      "Bash(where py *)",
+      "Bash(where python3 *)",
+      "Bash(py -V)",
+      "Bash(/c/Users/dhruv/anaconda3/Scripts/conda.exe run *)",
+      "Read(//c/Users/dhruv/AppData/Local/Temp/claude/C--Python-ipl/ac0fbe82-c091-41aa-b18b-9e46e85a5a19/tasks/**)",
+      "Read(//tmp/**)",
+      "Bash(tee /tmp/model_output.txt)",
+      "Bash(py310 src/main.py)"
     ]
   }
 }
